@@ -1,0 +1,41 @@
+name: 更新酒店源列表CSV
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force update all CSV files'
+        required: false
+        default: 'false'
+  schedule:
+    - cron: '0 3 * * *'  # 每天 UTC 3点自动运行
+
+jobs:
+  update-csv:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.x
+
+    - name: Install dependencies
+      run: pip install requests
+
+    - name: Run update script
+      run: python update_csv_files.py
+
+    - name: Commit and push if CSVs changed
+      run: |
+        git config --global user.name 'github-actions[bot]'
+        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+        git add txiptv.csv jsmpeg.csv zhgxtv.csv history/
+        if ! git diff --cached --quiet; then
+          git commit -m "自动更新CSV文件: $(date -u +'%Y-%m-%d %H:%M:%S')"
+          git push
+        else
+          echo "No changes to commit."
+        fi
