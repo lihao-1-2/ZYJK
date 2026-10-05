@@ -1,45 +1,46 @@
-name: 自动更新节目列表
+名称：自动更新节目列表: 自动更新节目列表
 
-on:
-  # 每天晚上20点自动运行
-  schedule:
+在：:
+  # 每天晚上20点自动运行# 每天晚上20点自动运行
+  时间表：:
     - cron: '0 20 * * *'
-  # 手动触发
-  workflow_dispatch:
+    - cron: '0 9 * * *'
+  # 手动触发# 手动触发
+  工作流_调度:
 
-jobs:
-  update:
-    runs-on: ubuntu-latest
+职位：:
+  更新：:
+    运行环境: ubuntu-latest: ubuntu-latest
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+    步骤：:
+      - 名称：结账代码name: Checkout code
+        使用：actions/checkout@v3: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: 3.9
+      - 名称：设置 Pythonname: Set up Python
+        使用：actions/setup-python@v4: actions/setup-python@v4
+        使用：:
+          python-version: 3.9: 3.9
 
-      - name: Install dependencies
-        run: |
+      - name: 安装依赖项name: Install dependencies
+        运行：|: |
           python -m pip install --upgrade pip
           pip install requests aiohttp
 
-      - name: Create output directory
-        run: mkdir -p output
+      - 名称：创建输出目录name: Create output directory
+        运行：mkdir -p output: mkdir -p output
 
-      - name: Run script
-        run: |
+      - 名称：运行脚本name: Run script
+        运行：|: |
           python all-z-j-new.py --jsmpeg jsmpeg.csv --txiptv txiptv.csv --zhgxtv zhgxtv.csv --output output/itvlist
 
-      - name: Commit and push changes
-        run: |
+      - 名称：提交并推送更改name: Commit and push changes
+        运行：|: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add output/
-          if git diff --staged --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "Update IPTV channel lists"
+          如果 git diff --staged --quiet; 那么
+            echo "没有需要提交的更改。"
+          否则
+            git commit -m "更新 IPTV 频道列表"
             git push --force-with-lease origin main
           fi
