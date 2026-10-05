@@ -1,7 +1,7 @@
 名称：自动更新节目列表: 自动更新节目列表
 
 在：:
-  # 每天晚上20点自动运行# 每天晚上20点自动运行
+  # 每天早上4点自动运行# 每天下午5点自动运行
   时间表：:
     - cron: '0 20 * * *'
     - cron: '0 9 * * *'
@@ -10,30 +10,30 @@
 
 职位：:
   更新：:
-    运行环境: ubuntu-latest: ubuntu-latest
+    运行环境: ubuntu-latestbuntu-latest: ubuntu-latest
 
     步骤：:
       - 名称：结账代码name: Checkout code
         使用：actions/checkout@v3: actions/checkout@v3
 
-      - 名称：设置 Pythonname: Set up Python
+      - 名称：设置 Pythonname: 设置 Python
         使用：actions/setup-python@v4: actions/setup-python@v4
         使用：:
-          python-version: 3.9: 3.9
+          python-version: 3.9.9: 3.9
 
-      - name: 安装依赖项name: Install dependencies
+      - 名称: 安装依赖项名称装依赖项name: 安装依赖项
         运行：|: |
           python -m pip install --upgrade pip
           pip install requests aiohttp
 
-      - 名称：创建输出目录name: Create output directory
+      - 名称：创建输出目录name: 创建输出目录
         运行：mkdir -p output: mkdir -p output
 
-      - 名称：运行脚本name: Run script
+      - 名称：运行脚本name: 运行脚本
         运行：|: |
           python all-z-j-new.py --jsmpeg jsmpeg.csv --txiptv txiptv.csv --zhgxtv zhgxtv.csv --output output/itvlist
 
-      - 名称：提交并推送更改name: Commit and push changes
+      - 名称：提交并推送更改name: 提交并推送更改
         运行：|: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
