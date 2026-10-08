@@ -3,9 +3,9 @@
 在：:
   # 每天晚上20点自动运行# 每天晚上20点自动运行
   时间表：:
-    - cron: '0 6 * * *'cron: '0 20 * * *'
+    - cron: '0 06 * * *'
   # 手动触发# 手动触发
-  workflow_dispatch::
+:
 
 职位：:
   更新：:
@@ -18,14 +18,14 @@
       - 名称：设置 Pythonname: 设置 Python
         使用：actions/setup-python@v4: actions/setup-python@v4
         使用：:
-          python-version: 3.9: 3.9
+          python-version: 3.9.9: 3.9
 
-      - 名称: 安装依赖项名称: 安装依赖项
+      - 名称: 安装依赖项名称装依赖项名称: 安装依赖项
         运行：|: |
           python -m pip install --upgrade pip
           pip install requests aiohttp
 
-      - 名称: 创建输出目录名称: 创建输出目录
+      - 名称: 创建输出目录名称建输出目录名称: 
         运行：mkdir -p output: mkdir -p output
 
       - 名称：运行脚本name: 运行脚本
