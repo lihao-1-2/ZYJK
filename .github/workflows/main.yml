@@ -1,13 +1,13 @@
-名称：自动更新节目列表: 
+name: 自动更新节目列表
 
-在：:
-  # 每天晚上20点自动运行# 每天晚上20点自动运行
-  时间表：:
-    - cron: '0 06 * * *'
-  # 手动触发# 手动触发
-:
+on:
+  # 每天晚上20点自动运行
+  schedule:
+    - cron: '0 9 * * *'
+  # 手动触发
+  workflow_dispatch:
 
-职位：:
+jobs:
   更新：:
     运行环境：ubuntu-latest: ubuntu-latest
 
