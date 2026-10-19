@@ -1,7 +1,7 @@
 name: IPTV‑早‑Update
 on:
   schedule:
-    - cron: '0 04 * * *'
+    - cron: '0 03 * * *'
       timezone: "Asia/Shanghai"
   workflow_dispatch:
 
