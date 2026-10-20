@@ -1,7 +1,7 @@
 name: IPTV‑晚‑Update
 on:
   schedule:
-    - cron: '0 15 * * *'
+    - cron: '0 19 * * *'
       timezone: "Asia/Shanghai"
   workflow_dispatch:
 
@@ -28,11 +28,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests aiohttp
 
-      - name: Create output directory
-        run: mkdir -p output
+      - name: 创建输出目录name: Create output directory
+        运行：mkdir -p output: mkdir -p output
 
-      - name: Run script
-        run: |
+      - 名称：运行脚本name: Run script
+        运行：|: |
           python all-z-j-new.py --jsmpeg jsmpeg.csv --txiptv txiptv.csv --zhgxtv zhgxtv.csv --output output/itvlist
 
       - name: Commit and push changes
