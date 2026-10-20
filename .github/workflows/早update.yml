@@ -1,0 +1,50 @@
+name: TV‑早‑Update
+on:
+  schedule:
+    - cron: '0 01 * * *'
+      timezone: "Asia/Shanghai"
+  workflow_dispatch:
+
+concurrency:
+  group: morning-job
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests aiohttp
+
+      - name: 创建输出目录name: Create output directory
+        运行：mkdir -p output: mkdir -p output
+
+      - 名称：运行脚本name: Run script
+        运行：|: |
+          python all-z-j-new.py --jsmpeg jsmpeg.csv --txiptv txiptv.csv --zhgxtv zhgxtv.csv --output output/itvlist
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action‑Morning"
+          git fetch origin
+          git add output/
+          if git diff --staged --quiet; then
+            echo "✅ 节目列表无更新，跳过提交"
+          else
+            git commit -m "Morning: Update IPTV channel lists"
+            git push --force origin main
+            echo "✅ 文件已更新并推送"
+          fi
