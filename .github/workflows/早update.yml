@@ -1,38 +1,38 @@
-name: IPTV‑早‑Update
-on:
-  schedule:
-    - cron: '0 03 * * *'
-      timezone: "Asia/Shanghai"
-  workflow_dispatch:
+名称：IPTV-早-更新: IPTV‑早‑Update
+在：:
+  时间表：:
+    - cron: '0 01 * * *'cron: '0 03 * * *'
+      时区: "Asia/Shanghai": "Asia/Shanghai"
+  workflow_dispatch::
 
-concurrency:
-  group: evening-job
-  cancel-in-progress: true
+并发：:
+  组：晚班: evening-job
+  取消进行中: true: true
 
-jobs:
-  update:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+职位：:
+  更新：:
+    运行环境: ubuntu-latest: ubuntu-latest
+    步骤：:
+      - 名称：结账码name: Checkout code
+        使用：actions/checkout@v4: actions/checkout@v4
+        使用：:
+          fetch-depth: 0: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.9"
+      - 名称：设置 Pythonname: Set up Python
+        使用：actions/setup-python@v5: actions/setup-python@v5
+        使用：:
+          python-version: "3.9": "3.9"
 
-      - name: Install dependencies
-        run: |
+      - name: 安装依赖项name: Install dependencies
+        运行：|: |
           python -m pip install --upgrade pip
           pip install requests aiohttp
 
-      - name: Create output directory
-        run: mkdir -p output
+      - name: 创建输出目录name: Create output directory
+        运行：mkdir -p output: mkdir -p output
 
-      - name: Run script
-        run: |
+      - 名称：运行脚本name: Run script
+        运行：|: |
           python all-z-j-new.py --jsmpeg jsmpeg.csv --txiptv txiptv.csv --zhgxtv zhgxtv.csv --output output/itvlist
 
       - name: Commit and push changes
