@@ -1,7 +1,7 @@
 名称：IPTV-早-更新: IPTV‑早‑Update
 在：:
   时间表：:
-    - cron: '0 01 * * *'cron: '0 03 * * *'
+    - cron: '0 01 * * *'
       时区: "Asia/Shanghai": "Asia/Shanghai"
   workflow_dispatch::
 
