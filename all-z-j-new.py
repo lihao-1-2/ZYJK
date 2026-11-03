@@ -119,11 +119,19 @@ async def get_channels_alltv(csv_file):
                 except Exception:
                     return []
                 out = []
+                # 接口返回可能是对象数组，也可能是字符串数组，逐条容错
+                if not isinstance(json_data, list):
+                    return out
                 for item in json_data:
-                    name = str(item.get('name', '')).strip()
-                    key = str(item.get('key', '')).strip()
-                    if name and key:
-                        out.append((channel_name_normalize(name), f"{host}/hls/{key}/index.m3u8"))
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        name = str(item.get('name', '')).strip()
+                        key = str(item.get('key', '')).strip()
+                        if name and key:
+                            out.append((channel_name_normalize(name), f"{host}/hls/{key}/index.m3u8"))
+                    except Exception:
+                        continue
                 return out
 
         results = await asyncio.gather(*(fetch(u) for u in valid_urls))
@@ -175,7 +183,9 @@ async def get_channels_newnew(csv_file):
                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT)) as resp:
                         json_data = await resp.json(content_type=None)
                     out = []
-                    for item in json_data.get('data', []):
+                    if not isinstance(json_data, dict):
+                        return out
+                    for item in json_data.get('data', []) or []:
                         if isinstance(item, dict):
                             name = item.get('name')
                             urlx = item.get('url')
