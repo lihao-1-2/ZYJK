@@ -44,8 +44,7 @@ SAMPLE_BYTES = 384 * 1024        # 每个频道最多采样字节
 SAMPLE_SECONDS = 2.0             # 采样时间上限（秒）
 MAX_BODY = 4 * 1024 * 1024       # 数据接口响应体上限，防异常大响应
 PLAYLIST_MAX_BODY = 512 * 1024   # m3u8 响应体上限
-MAX_SOURCES_PER_CHANNEL = 15     # speed.txt 中每个频道保留的源数
-MAX_OUTPUT_PER_CHANNEL = 8       # txt / m3u 中每个频道保留的源数
+MAX_SOURCES_PER_CHANNEL = 3      # 每个频道保留的最快源数量（txt / m3u / speed.txt 一致）
 SPEED_FILE = "speed.txt"         # 与原版一致：写在当前工作目录
 USER_AGENT = "okhttp/3.12.1"     # 多数 IPTV 服务端按播放器 UA 放行
 GENRES = ("央视频道", "卫视频道", "其他频道")
@@ -474,8 +473,14 @@ async def run_speed_stage(
 
 
 # ------------------------------------------------------------------ 结果整理 --
-def aggregate(results: Sequence[Tuple[str, str, float]]) -> List[Tuple[str, str, str]]:
-    """按频道取速度前 15、去重、排序，返回 (名称, 地址, "x MB/s")。"""
+def aggregate(
+    results: Sequence[Tuple[str, str, float]],
+    limit: int = MAX_SOURCES_PER_CHANNEL,
+) -> List[Tuple[str, str, str]]:
+    """每个频道取速度最快的 limit 个源，频道内按速度从快到慢排列。
+
+    返回 (名称, 地址, "x MB/s")，整体按频道名排序（CCTV 按番号在前）。
+    """
     by_name: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
     for name, url, speed in results:
         by_name[name].append((url, speed))
@@ -483,7 +488,7 @@ def aggregate(results: Sequence[Tuple[str, str, float]]) -> List[Tuple[str, str,
     kept: List[Tuple[str, str, float]] = []
     for name in sorted(by_name):
         sources = sorted(by_name[name], key=lambda x: x[1], reverse=True)
-        for url, speed in sources[:MAX_SOURCES_PER_CHANNEL]:
+        for url, speed in sources[:limit]:
             kept.append((name, url, speed))
 
     seen = set()
@@ -495,6 +500,7 @@ def aggregate(results: Sequence[Tuple[str, str, float]]) -> List[Tuple[str, str,
         seen.add(key)
         unique.append((name, url, "{0:.3f} MB/s".format(speed)))
 
+    # stable sort：只按频道名重排，同一频道内保留前面的"速度从快到慢"顺序
     unique.sort(key=_sort_key)
     return unique
 
@@ -515,19 +521,21 @@ def in_genre(name: str, genre: str) -> bool:
     return "CCTV" not in name and "卫视" not in name and "测试" not in name
 
 
-def iter_genre(channels: Sequence[Tuple[str, str, str]], genre: str):
+def iter_genre(channels: Sequence[Tuple[str, str, str]], genre: str, limit: int):
     counters: Dict[str, int] = {}
     for name, url, _ in channels:
         if not in_genre(name, genre):
             continue
         used = counters.get(name, 0)
-        if used >= MAX_OUTPUT_PER_CHANNEL:
+        if used >= limit:
             continue
         counters[name] = used + 1
         yield name, url
 
 
-def write_outputs(channels: Sequence[Tuple[str, str, str]], prefix: str) -> None:
+def write_outputs(
+    channels: Sequence[Tuple[str, str, str]], prefix: str, limit: int
+) -> None:
     parent = os.path.dirname(os.path.abspath(prefix))
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -535,13 +543,13 @@ def write_outputs(channels: Sequence[Tuple[str, str, str]], prefix: str) -> None
     with open(prefix + ".txt", "w", encoding="utf-8") as fp:
         for genre in GENRES:
             fp.write("{0},#genre#\n".format(genre))
-            for name, url in iter_genre(channels, genre):
+            for name, url in iter_genre(channels, genre, limit):
                 fp.write("{0},{1}\n".format(name, url))
 
     with open(prefix + ".m3u", "w", encoding="utf-8") as fp:
         fp.write("#EXTM3U\n")
         for genre in GENRES:
-            for name, url in iter_genre(channels, genre):
+            for name, url in iter_genre(channels, genre, limit):
                 fp.write('#EXTINF:-1 group-title="{0}",{1}\n'.format(genre, name))
                 fp.write(url + "\n")
 
@@ -567,6 +575,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="测速采样上限 KB，默认 %d" % (SAMPLE_BYTES // 1024))
     parser.add_argument("--sample-seconds", type=float, default=SAMPLE_SECONDS,
                         help="测速采样时间上限秒，默认 %.1f" % SAMPLE_SECONDS)
+    parser.add_argument("--max-sources", type=int,
+                        default=MAX_SOURCES_PER_CHANNEL,
+                        help="每个频道保留的最快源数量，默认 %d"
+                             % MAX_SOURCES_PER_CHANNEL)
     return parser.parse_args(argv)
 
 
@@ -616,10 +628,13 @@ async def run(args: argparse.Namespace) -> int:
     print("[测速] 耗时 {0:.1f}s，可用 {1} 个".format(
         time.monotonic() - t1, len(results)))
 
-    final = aggregate(results)
-    write_outputs(final, args.output)
-    print("[完成] 输出 {0}.txt / {0}.m3u / {1}，有效频道 {2} 条，总耗时 {3:.1f}s".format(
-        args.output, SPEED_FILE, len(final), time.monotonic() - started))
+    limit = max(args.max_sources, 1)
+    final = aggregate(results, limit)
+    write_outputs(final, args.output, limit)
+    print("[完成] 输出 {0}.txt / {0}.m3u / {1}，有效频道 {2} 条"
+          "（每频道最多 {3} 个源），总耗时 {4:.1f}s".format(
+              args.output, SPEED_FILE, len(final), limit,
+              time.monotonic() - started))
     return 0
 
 
