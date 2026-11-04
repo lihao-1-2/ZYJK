@@ -3,18 +3,31 @@
 
 相对 all-z-j-new.py 的关键改动（输出格式、命令行参数完全兼容）：
 
-1. 探测与数据拉取合并为同一次请求
-   旧版先 GET "/" 判存活、再 GET 数据接口，请求数翻倍；本版直接请求数据
-   接口，2xx 即视为存活并复用响应体。
-2. requests + 100 线程  ->  aiohttp 单会话 + 单信号量高并发
-   消除每请求重建 TCP 的开销；去掉 3 次串行重试（1s 内失败的主机重试也
-   基本不会成功，纯粹放大耗时）。
-3. 全流程异步：采集、测速共用一条流水线，不再出现"串行 for 循环拉 JSON"。
-4. 测速改为采样：只读首个分片的前 N KB（时间 + 字节双上限）；旧版是 5s
-   超时全量下载整个 TS 分片，慢源白白吃掉 5 秒。计时从 os.times()[0]
-   （进程 CPU 时间，多线程下互相污染）改为 time.monotonic() 墙钟。
-5. 进度输出节流（TTY 0.5s / 日志 3s 一次），避免上千行 print 拖慢 CI。
-6. 候选源先去重再测速，同名频道按名称稳定排序，结果可复现。
+【采集】
+1. 探测与数据拉取合并为同一次请求：旧版先 GET "/" 判存活、再 GET 数据接口，
+   请求数翻倍；本版直接请求数据接口，2xx 即视为存活并复用响应体。
+2. requests + 100 线程 -> aiohttp 单会话 + 信号量高并发，消除每请求重建
+   TCP 的开销，并去掉 3 次串行重试（1s 内不通的主机重试也不会通）。
+3. 三种模式并发采集，总耗时取"最长"而不是"相加"。
+
+【校验与测速】
+4. 分片多路尝试：旧版只取播放列表第一个分片，直播场景里首个分片常已过窗
+   而 404，会把好源误杀。本版按顺序最多试 3 个分片，命中即止。
+5. 放宽状态码到 2xx（含 206 分段响应），并在采样超时时保留已收到的字节，
+   把"慢但活着"的高码率源保住。
+6. 两级有效性：真正读到分片字节 = 已校验（有实测速度）；只有播放列表可用
+   = 备用源（速度记 0.001），仅在已校验源不足时才用于补位。
+7. 采样测速：只读首个分片的前 N KB（时间 + 字节双上限），旧版是 5s 超时
+   全量下载整个分片，慢源白吃 5 秒。计时从 os.times()[0]（进程 CPU 时间，
+   多线程互相污染）改为 time.monotonic() 墙钟。
+
+【选源】
+8. 清晰度优先：从原始频道名与地址中识别 4K/1080/720/标清，排序时清晰度
+   优先、速度次之，避免低码率源把 1080 源挤掉。
+9. 每个频道最多保留 --max-sources 个（默认 3），并可按 --max-candidates
+   限制每频道参与测速的候选数（默认 12，0 表示全测），大幅压缩测速耗时。
+10. 进度输出节流（TTY 0.5s / 日志 3s 一次），并输出每频道源数分布，便于
+    排查"某个节目只有 1 个源"这类问题。
 
 用法（与原版一致）：
     python all-z-j-new-fast.py --jsmpeg jsmpeg.csv --txiptv txiptv.csv \\
@@ -29,7 +42,7 @@ import os
 import re
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin, urlsplit
 
@@ -40,11 +53,13 @@ PROBE_CONCURRENCY = 600          # 探测并发（每个主机展开 255 个任�
 SPEED_CONCURRENCY = 200          # 测速并发
 PROBE_TIMEOUT = 1.5              # 探测单请求总超时（秒）
 PLAYLIST_TIMEOUT = 3.0           # 拉取 m3u8 超时（秒）
-SAMPLE_BYTES = 384 * 1024        # 每个频道最多采样字节
+SAMPLE_BYTES = 384 * 1024        # 每个源最多采样字节
 SAMPLE_SECONDS = 2.0             # 采样时间上限（秒）
 MAX_BODY = 4 * 1024 * 1024       # 数据接口响应体上限，防异常大响应
 PLAYLIST_MAX_BODY = 512 * 1024   # m3u8 响应体上限
-MAX_SOURCES_PER_CHANNEL = 3      # 每个频道保留的最快源数量（txt / m3u / speed.txt 一致）
+SEGMENT_TRIES = 3                # 每个源最多尝试几个分片
+MAX_SOURCES_PER_CHANNEL = 3      # 每个频道保留的源数量（txt / m3u / speed.txt 一致）
+MAX_CANDIDATES_PER_CHANNEL = 12  # 每个频道最多测几个候选源，0 = 全测
 SPEED_FILE = "speed.txt"         # 与原版一致：写在当前工作目录
 USER_AGENT = "okhttp/3.12.1"     # 多数 IPTV 服务端按播放器 UA 放行
 GENRES = ("央视频道", "卫视频道", "其他频道")
@@ -57,8 +72,14 @@ EP_TXIPTV = "/iptv/live/1000.json?key=txiptv"
 
 # ------------------------------------------------------------ 频道名归一化 --
 _NORMALIZE_REPS = (
-    ("高清", ""), ("超高", ""), ("HD", ""), ("标清", ""), ("频道", ""),
-    ("-", ""), (" ", ""), ("PLUS", "+"), ("＋", "+"), ("(", ""), (")", ""),
+    # 清晰度标记要一并剥离，否则 "CCTV5体育1080" 会另立门户，
+    # 高清源无法归并到同一个频道名下参与排序
+    ("2160P", ""), ("2160p", ""), ("2160", ""), ("4K", ""), ("4k", ""),
+    ("1080P", ""), ("1080p", ""), ("1080", ""), ("FHD", ""), ("fhd", ""),
+    ("720P", ""), ("720p", ""), ("720", ""),
+    ("高清", ""), ("超清", ""), ("蓝光", ""), ("超高", ""), ("HD", ""), ("标清", ""),
+    ("频道", ""), ("-", ""), (" ", ""), ("PLUS", "+"), ("＋", "+"),
+    ("(", ""), (")", ""),
 )
 
 _NAME_MAP = {
@@ -74,6 +95,15 @@ _NAME_MAP = {
     "CCTV5+体育赛视": "CCTV5+", "CCTV5+体育赛事": "CCTV5+", "CCTV5+体育": "CCTV5+",
 }
 
+# 清晰度识别：命中任意关键词即记为该档位，取最高档
+_QUALITY_RULES = (
+    (2160, ("2160", "4k", "uhd")),
+    (1080, ("1080", "fhd", "fullhd", "full_hd", "full-hd", "高清", "超清", "蓝光", "hd")),
+    (720, ("720",)),
+    (576, ("标清", "-sd", "_sd")),
+)
+QUALITY_LABEL = {2160: "4K", 1080: "1080P", 720: "720P", 576: "标清", 0: "未知"}
+
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 _CCTV_NO_RE = re.compile(r"CCTV(\d+)台")
 
@@ -84,6 +114,18 @@ def channel_name_normalize(name: str) -> str:
         name = name.replace(old, new)
     name = _CCTV_NO_RE.sub(r"CCTV\1", name)
     return _NAME_MAP.get(name, name)
+
+
+def quality_score(*texts: Optional[str]) -> int:
+    """从原始频道名 / 地址 / key 里识别清晰度档位，无法识别返回 0。"""
+    blob = " ".join(t for t in texts if t).lower()
+    if not blob:
+        return 0
+    for score, tokens in _QUALITY_RULES:
+        for token in tokens:
+            if token in blob:
+                return score
+    return 0
 
 
 # ------------------------------------------------------------------ 目标生成 --
@@ -174,13 +216,13 @@ async def fetch(
     timeout: float,
     limit: int = MAX_BODY,
 ) -> Optional[bytes]:
-    """一次请求取回响应体；非 200 或任何异常返回 None。"""
+    """一次请求取回响应体；非 2xx 或任何异常返回 None。"""
     async with sem:
         try:
             async with session.get(
                 url, timeout=_timeout(timeout), allow_redirects=True
             ) as resp:
-                if resp.status != 200:
+                if resp.status >= 300:
                     resp.close()
                     return None
                 return await resp.content.read(limit)
@@ -190,7 +232,15 @@ async def fetch(
 
 
 # ------------------------------------------------------------- 三种采集模式 --
-async def _resolve_all(session, targets, sem, timeout) -> List[Tuple[str, Optional[bytes]]]:
+def _add_channel(bucket, raw_name, url, extra=None):
+    name = (raw_name or "").strip()
+    if not name or not url:
+        return
+    bucket.append((channel_name_normalize(name), url,
+                   quality_score(name, url, extra)))
+
+
+async def _resolve_all(session, targets, sem, timeout):
     if not targets:
         return []
     bodies = await asyncio.gather(
@@ -202,14 +252,14 @@ async def _resolve_all(session, targets, sem, timeout) -> List[Tuple[str, Option
 async def collect_jsmpeg(
     session: aiohttp.ClientSession, csv_file: str,
     sem: asyncio.Semaphore, timeout: float,
-) -> List[Tuple[str, str]]:
+) -> List[Tuple[str, str, int]]:
     hosts = read_csv_column(csv_file, "host")
     targets = build_targets(hosts, EP_JSMSEG)
     if not targets:
         return []
     print("[jsmpeg] 待探测 {0} 个接口".format(len(targets)))
 
-    channels: List[Tuple[str, str]] = []
+    channels: List[Tuple[str, str, int]] = []
     alive = 0
     for target, body in await _resolve_all(session, targets, sem, timeout):
         if not body:
@@ -225,11 +275,10 @@ async def collect_jsmpeg(
         for item in data:
             if not isinstance(item, dict):
                 continue
-            name = (item.get("name") or "").strip()
             key = (item.get("key") or "").strip()
-            if name and key:
-                channels.append((channel_name_normalize(name),
-                                 "{0}/hls/{1}/index.m3u8".format(origin, key)))
+            if key:
+                _add_channel(channels, item.get("name"),
+                             "{0}/hls/{1}/index.m3u8".format(origin, key), key)
     print("[jsmpeg] 存活 {0} 个，采集频道 {1} 条".format(alive, len(channels)))
     return channels
 
@@ -237,14 +286,14 @@ async def collect_jsmpeg(
 async def collect_zhgxtv(
     session: aiohttp.ClientSession, csv_file: str,
     sem: asyncio.Semaphore, timeout: float,
-) -> List[Tuple[str, str]]:
+) -> List[Tuple[str, str, int]]:
     hosts = read_csv_column(csv_file, "host")
     targets = build_targets(hosts, EP_ZHGXTV)
     if not targets:
         return []
     print("[zhgxtv] 待探测 {0} 个接口".format(len(targets)))
 
-    channels: List[Tuple[str, str]] = []
+    channels: List[Tuple[str, str, int]] = []
     alive = 0
     for target, body in await _resolve_all(session, targets, sem, timeout):
         if not body:
@@ -259,10 +308,7 @@ async def collect_zhgxtv(
             if not line or "," not in line:
                 continue
             name, _, raw_url = line.partition(",")
-            name = name.strip()
-            url = rebase_url(raw_url, origin)
-            if name and url:
-                channels.append((channel_name_normalize(name), url))
+            _add_channel(channels, name, rebase_url(raw_url, origin))
     print("[zhgxtv] 存活 {0} 个，采集频道 {1} 条".format(alive, len(channels)))
     return channels
 
@@ -270,14 +316,14 @@ async def collect_zhgxtv(
 async def collect_txiptv(
     session: aiohttp.ClientSession, csv_file: str,
     sem: asyncio.Semaphore, timeout: float,
-) -> List[Tuple[str, str]]:
+) -> List[Tuple[str, str, int]]:
     hosts = read_csv_column(csv_file, "link")
     targets = build_targets(hosts, EP_TXIPTV)
     if not targets:
         return []
     print("[txiptv] 待探测 {0} 个接口".format(len(targets)))
 
-    channels: List[Tuple[str, str]] = []
+    channels: List[Tuple[str, str, int]] = []
     alive = 0
     for target, body in await _resolve_all(session, targets, sem, timeout):
         if not body:
@@ -294,15 +340,14 @@ async def collect_txiptv(
         for item in items:
             if not isinstance(item, dict):
                 continue
-            name = (item.get("name") or "").strip()
             raw_url = _first_field(item.get("url"))
-            if not name or not raw_url:
+            if not raw_url:
                 continue
             if raw_url.startswith(("http://", "https://")):
                 url = raw_url
             else:
                 url = origin + (raw_url if raw_url.startswith("/") else "/" + raw_url)
-            channels.append((channel_name_normalize(name), url))
+            _add_channel(channels, item.get("name"), url)
     print("[txiptv] 存活 {0} 个，采集频道 {1} 条".format(alive, len(channels)))
     return channels
 
@@ -366,31 +411,49 @@ class Progress(object):
             sys.stdout.flush()
 
 
-async def resolve_segment(
-    session: aiohttp.ClientSession, playlist_url: str,
-    sem: asyncio.Semaphore, max_depth: int = 1,
-) -> Optional[str]:
-    """取播放列表里的首个分片；主播放列表再降一层。"""
-    body = await fetch(session, playlist_url, sem, PLAYLIST_TIMEOUT,
-                       limit=PLAYLIST_MAX_BODY)
-    if not body:
-        return None
+def _playlist_lines(body: bytes, base: str) -> Tuple[List[str], List[str]]:
+    """拆出 (分片地址, 子播放列表地址)。"""
+    segments: List[str] = []
+    variants: List[str] = []
     for line in body.decode("utf-8", errors="ignore").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        if line.endswith(".m3u8") and max_depth > 0:
-            return await resolve_segment(session, urljoin(playlist_url, line),
-                                         sem, max_depth - 1)
-        return urljoin(playlist_url, line)
-    return None
+        url = urljoin(base, line)
+        if url.split("?")[0].endswith(".m3u8"):
+            variants.append(url)
+        else:
+            segments.append(url)
+    return segments, variants
 
 
-async def sample_speed(
+async def candidate_segments(
+    session: aiohttp.ClientSession, playlist_url: str,
+    sem: asyncio.Semaphore, want: int = SEGMENT_TRIES,
+) -> Optional[List[str]]:
+    """返回待尝试的分片地址列表。
+
+    None  -> 播放列表本身不可用（该源直接丢弃）
+    []    -> 播放列表可用但没解析出分片（源保留为备用）
+    """
+    body = await fetch(session, playlist_url, sem, PLAYLIST_TIMEOUT,
+                       limit=PLAYLIST_MAX_BODY)
+    if not body:
+        return None
+    segments, variants = _playlist_lines(body, playlist_url)
+    if not segments and variants:      # 主播放列表：降一层拿真实分片
+        body = await fetch(session, variants[0], sem, PLAYLIST_TIMEOUT,
+                           limit=PLAYLIST_MAX_BODY)
+        if body:
+            segments, _ = _playlist_lines(body, variants[0])
+    return segments[:want]
+
+
+async def sample_throughput(
     session: aiohttp.ClientSession, url: str, sem: asyncio.Semaphore,
     sample_bytes: int, sample_seconds: float,
 ) -> Optional[float]:
-    """读取前 sample_bytes 或 sample_seconds，返回 MB/s。"""
+    """读取前 sample_bytes 或 sample_seconds，返回 MB/s；一个字节都没收到返回 None。"""
     async with sem:
         start = time.monotonic()
         total = 0
@@ -400,7 +463,7 @@ async def sample_speed(
                 timeout=_timeout(sample_seconds + 3.0, sock_read=sample_seconds + 1.0),
                 allow_redirects=True,
             ) as resp:
-                if resp.status != 200:
+                if resp.status >= 300:
                     resp.close()
                     return None
                 async for chunk in resp.content.iter_chunked(64 * 1024):
@@ -409,31 +472,52 @@ async def sample_speed(
                         break
                     if time.monotonic() - start >= sample_seconds:
                         break
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError):
-            return None
+        except asyncio.TimeoutError:
+            pass                        # 超时但已收到数据，按已收字节计速
+        except (aiohttp.ClientError, OSError, ValueError):
+            pass
         if not total:
             return None
         return total / max(time.monotonic() - start, 1e-3) / 1048576.0
 
 
-async def run_speed_stage(
-    channels: Sequence[Tuple[str, str]],
-    probe_concurrency: int, speed_concurrency: int,
-    sample_bytes: int, sample_seconds: float,
-) -> List[Tuple[str, str, float]]:
-    unique: List[Tuple[str, str]] = []
+def select_candidates(
+    channels: Sequence[Tuple[str, str, int]], per_channel: int
+) -> List[Tuple[str, str, int]]:
+    """去重，并按频道挑选参与测速的候选：清晰度高的先测。"""
+    unique: List[Tuple[str, str, int]] = []
     seen = set()
-    for name, url in channels:
+    for name, url, quality in channels:
         key = (name, url)
-        if key in seen:                 # 同一个源不重复测
+        if key in seen:
             continue
         seen.add(key)
-        unique.append((name, url))
+        unique.append((name, url, quality))
 
+    if per_channel <= 0:
+        return unique
+
+    grouped: Dict[str, List[Tuple[str, str, int]]] = defaultdict(list)
+    for item in unique:
+        grouped[item[0]].append(item)
+
+    picked: List[Tuple[str, str, int]] = []
+    for name in sorted(grouped):
+        group = sorted(grouped[name], key=lambda x: -x[2])   # 清晰度优先
+        picked.extend(group[:per_channel])
+    return picked
+
+
+async def run_speed_stage(
+    channels: Sequence[Tuple[str, str, int]],
+    probe_concurrency: int, speed_concurrency: int,
+    sample_bytes: int, sample_seconds: float,
+) -> List[Tuple[str, str, int, float, bool]]:
+    """返回 (名称, 地址, 清晰度, 速度, 是否已校验)。"""
     probe_sem = asyncio.Semaphore(max(probe_concurrency, 1))
     speed_sem = asyncio.Semaphore(max(speed_concurrency, 1))
-    progress = Progress(len(unique), "测速进度")
-    results: List[Tuple[str, str, float]] = []
+    progress = Progress(len(channels), "测速进度")
+    results: List[Tuple[str, str, int, float, bool]] = []
 
     async with aiohttp.ClientSession(
         headers={"User-Agent": USER_AGENT},
@@ -441,21 +525,29 @@ async def run_speed_stage(
             limit=0, limit_per_host=0, ttl_dns_cache=600,
             enable_cleanup_closed=True, force_close=False),
     ) as session:
-        async def worker(name: str, url: str):
-            speed = None
+        async def worker(name: str, url: str, quality: int):
             try:
-                segment = await resolve_segment(session, url, probe_sem)
-                if segment:
-                    speed = await sample_speed(session, segment, speed_sem,
-                                               sample_bytes, sample_seconds)
-            except Exception:           # 单源异常不影响整批
+                segments = await candidate_segments(session, url, probe_sem)
+                if segments is None:            # 播放列表都打不开
+                    progress.tick(False)
+                    return None
                 speed = None
-            progress.tick(speed is not None)
-            if speed is None:
+                for segment in segments:
+                    speed = await sample_throughput(
+                        session, segment, speed_sem, sample_bytes, sample_seconds)
+                    if speed is not None:
+                        break
+                if speed is not None:
+                    progress.tick(True)
+                    return name, url, quality, min(max(speed, 0.001), 100.0), True
+                progress.tick(False)
+                # 播放列表可用但分片没拿到字节：留作备用源，排最后
+                return name, url, quality, 0.001, False
+            except Exception:                   # 单源异常不影响整批
+                progress.tick(False)
                 return None
-            return name, url, min(max(speed, 0.001), 100.0)
 
-        tasks = [asyncio.ensure_future(worker(n, u)) for n, u in unique]
+        tasks = [asyncio.ensure_future(worker(*item)) for item in channels]
         try:
             for fut in asyncio.as_completed(tasks):
                 try:
@@ -474,21 +566,22 @@ async def run_speed_stage(
 
 # ------------------------------------------------------------------ 结果整理 --
 def aggregate(
-    results: Sequence[Tuple[str, str, float]],
+    results: Sequence[Tuple[str, str, int, float, bool]],
     limit: int = MAX_SOURCES_PER_CHANNEL,
 ) -> List[Tuple[str, str, str]]:
-    """每个频道取速度最快的 limit 个源，频道内按速度从快到慢排列。
-
-    返回 (名称, 地址, "x MB/s")，整体按频道名排序（CCTV 按番号在前）。
-    """
-    by_name: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
-    for name, url, speed in results:
-        by_name[name].append((url, speed))
+    """每个频道取最快的 limit 个源：清晰度优先、速度次之；已校验源优先于备用源。"""
+    grouped: Dict[str, List[Tuple[str, str, int, float, bool]]] = defaultdict(list)
+    for item in results:
+        grouped[item[0]].append(item)
 
     kept: List[Tuple[str, str, float]] = []
-    for name in sorted(by_name):
-        sources = sorted(by_name[name], key=lambda x: x[1], reverse=True)
-        for url, speed in sources[:limit]:
+    for name in sorted(grouped):
+        group = grouped[name]
+        verified = sorted([x for x in group if x[4]],
+                          key=lambda x: (-x[2], -x[3]))
+        fallback = sorted([x for x in group if not x[4]],
+                          key=lambda x: -x[2])
+        for url, speed in [(x[1], x[3]) for x in (verified + fallback)[:limit]]:
             kept.append((name, url, speed))
 
     seen = set()
@@ -500,7 +593,7 @@ def aggregate(
         seen.add(key)
         unique.append((name, url, "{0:.3f} MB/s".format(speed)))
 
-    # stable sort：只按频道名重排，同一频道内保留前面的"速度从快到慢"顺序
+    # stable sort：只按频道名重排，频道内保留"清晰度优先、速度从快到慢"的顺序
     unique.sort(key=_sort_key)
     return unique
 
@@ -558,6 +651,23 @@ def write_outputs(
             fp.write(",".join(row) + "\n")
 
 
+def report_distribution(
+    final: Sequence[Tuple[str, str, str]], limit: int
+) -> None:
+    """打印每频道源数分布，一眼看出哪个节目没凑够源。"""
+    counts = Counter(name for name, _, _ in final)
+    if not counts:
+        return
+    dist = Counter(counts.values())
+    summary = "，".join("{0} 个源×{1}".format(k, dist[k]) for k in sorted(dist))
+    print("[统计] 有效频道 {0} 个：{1}".format(len(counts), summary))
+    short = [n for n, c in counts.items() if c < limit]
+    if short:
+        head = "、".join(short[:12])
+        more = "" if len(short) <= 12 else " 等 {0} 个".format(len(short))
+        print("  源数不足 {0} 个的频道：{1}{2}".format(limit, head, more))
+
+
 # --------------------------------------------------------------------- 主流程 --
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="多模式IPTV频道批量探测与测速")
@@ -577,8 +687,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="测速采样时间上限秒，默认 %.1f" % SAMPLE_SECONDS)
     parser.add_argument("--max-sources", type=int,
                         default=MAX_SOURCES_PER_CHANNEL,
-                        help="每个频道保留的最快源数量，默认 %d"
+                        help="每个频道保留的源数量，默认 %d"
                              % MAX_SOURCES_PER_CHANNEL)
+    parser.add_argument("--max-candidates", type=int,
+                        default=MAX_CANDIDATES_PER_CHANNEL,
+                        help="每个频道最多测几个候选源（清晰度高的优先），"
+                             "默认 %d，0 表示全部测" % MAX_CANDIDATES_PER_CHANNEL)
     return parser.parse_args(argv)
 
 
@@ -588,8 +702,9 @@ async def run(args: argparse.Namespace) -> int:
     timeout = max(args.probe_timeout, 0.2)
     sample_bytes = max(args.sample_kb, 16) * 1024
     sample_seconds = max(args.sample_seconds, 0.2)
+    limit = max(args.max_sources, 1)
 
-    channels: List[Tuple[str, str]] = []
+    channels: List[Tuple[str, str, int]] = []
     sem = asyncio.Semaphore(probe_concurrency)
     connector = aiohttp.TCPConnector(
         limit=0, limit_per_host=0, ttl_dns_cache=600,
@@ -621,20 +736,24 @@ async def run(args: argparse.Namespace) -> int:
         print("未采集到任何频道，请检查 csv 文件")
         return 1
 
+    candidates = select_candidates(channels, args.max_candidates)
+    print("[候选] {0} 个频道、{1} 个待测源（每频道上限 {2}）".format(
+        len(set(c[0] for c in candidates)), len(candidates),
+        args.max_candidates if args.max_candidates > 0 else "不限"))
+
     t1 = time.monotonic()
     results = await run_speed_stage(
-        channels, probe_concurrency, args.speed_concurrency,
+        candidates, probe_concurrency, args.speed_concurrency,
         sample_bytes, sample_seconds)
-    print("[测速] 耗时 {0:.1f}s，可用 {1} 个".format(
-        time.monotonic() - t1, len(results)))
+    verified = sum(1 for r in results if r[4])
+    print("[测速] 耗时 {0:.1f}s，可用 {1} 个（其中实测通过 {2} 个）".format(
+        time.monotonic() - t1, len(results), verified))
 
-    limit = max(args.max_sources, 1)
     final = aggregate(results, limit)
     write_outputs(final, args.output, limit)
-    print("[完成] 输出 {0}.txt / {0}.m3u / {1}，有效频道 {2} 条"
-          "（每频道最多 {3} 个源），总耗时 {4:.1f}s".format(
-              args.output, SPEED_FILE, len(final), limit,
-              time.monotonic() - started))
+    report_distribution(final, limit)
+    print("[完成] 输出 {0}.txt / {0}.m3u / {1}，共 {2} 条，总耗时 {3:.1f}s".format(
+        args.output, SPEED_FILE, len(final), time.monotonic() - started))
     return 0
 
 
