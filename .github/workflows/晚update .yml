@@ -3,7 +3,7 @@ name: 晚update
 on:
   # 每天晚上6点自动运行
   schedule:
-    - cron: '0 19 * * *'
+    - cron: '0 12 * * *'
       timezone: "Asia/Shanghai"
   # 手动触发
   workflow_dispatch:
